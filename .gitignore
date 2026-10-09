@@ -1,0 +1,27 @@
+# 密钥与本机凭据：永远不要提交
+cipherhelper/cipher/keydata_local.go
+cipherhelper/cipher/keydata.go.orig-backup
+keydata_local.go
+
+# 门户凭据与会话
+portal.user
+portal.password
+portal.current.conf
+portal-session.*
+algo-*.env
+damod-update.bin*
+
+# 抓包 / 门户页面 / 中间产物
+*.html
+out*.txt
+c*.json
+*.bin
+
+# 构建产物
+*.exe
+dist/
+node_modules/
+
+# 其他
+.DS_Store
+Thumbs.db
