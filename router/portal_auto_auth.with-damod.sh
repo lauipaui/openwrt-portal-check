@@ -174,6 +174,19 @@ sed_replacement_escape() {
     printf '%s' "$1" | sed 's/[\\&#]/\\&/g'
 }
 
+# A URL taken from the (untrusted, plain-HTTP, MITM-able) portal page is written
+# into the config file, which is later sourced by the client as shell.  Only
+# accept characters that legitimately occur in these URLs; reject anything that
+# could break out of the single-quoted assignment (', $, `, \, whitespace, ...).
+# This is the primary defence against portal-driven command injection.
+safe_portal_url() {
+    case "$1" in
+        '' | *[!A-Za-z0-9._:/?=\&%~@+-]*) return 1 ;;
+        http://* | https://*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 extract_cdata_tag() {
     awk -v tag="$1" '
         {
@@ -222,8 +235,10 @@ refresh_portal_endpoints() {
     fetch_portal_page || return 1
     page_ticket=$(extract_cdata_tag ticket-url "$portal_page_file")
     page_auth=$(extract_cdata_tag auth-url "$portal_page_file")
-    case "$page_ticket" in http://*|https://*) ;; *) return 1 ;; esac
-    case "$page_auth" in http://*|https://*) ;; *) return 1 ;; esac
+    if ! safe_portal_url "$page_ticket" || ! safe_portal_url "$page_auth"; then
+        log_message 'Portal page returned a ticket/auth URL with unexpected characters; refusing to adopt it.'
+        return 1
+    fi
     current_ticket=$(config_value TICKET_URL)
     current_auth=$(config_value AUTH_URL)
     new_ticket=$page_ticket
@@ -232,6 +247,10 @@ refresh_portal_endpoints() {
     fi
     new_auth=$page_auth
     [ "$new_ticket" != "$current_ticket" ] || [ "$new_auth" != "$current_auth" ] || return 1
+    if ! safe_portal_url "$new_ticket" || ! safe_portal_url "$new_auth"; then
+        log_message 'Constructed portal URL contains unexpected characters; refusing to rewrite the configuration.'
+        return 1
+    fi
     cp -p "$config" "$config.bak-portal-$(date +%Y%m%d-%H%M%S)" || return 1
     tmp_config="$config.tmp.$$"
     if sed -e "s#^TICKET_URL=.*#TICKET_URL='$(sed_replacement_escape "$new_ticket")'#" \

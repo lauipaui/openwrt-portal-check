@@ -79,9 +79,17 @@ func decodeModule(payload []byte) ([]byte, int, int, error) {
 	if err != nil {
 		return nil, modType, modSize, fmt.Errorf("lzma reader: %w", err)
 	}
-	out, err := io.ReadAll(r)
+	// The module is attacker-controlled (the portal hands it out over plain
+	// HTTP), so cap decompression to defend against a decompression bomb that
+	// would otherwise exhaust memory on a small router.  maxDecoded comfortably
+	// exceeds any real module while staying well inside available RAM.
+	const maxDecoded = 16 << 20
+	out, err := io.ReadAll(io.LimitReader(r, maxDecoded+1))
 	if err != nil {
 		return nil, modType, modSize, fmt.Errorf("lzma read: %w", err)
+	}
+	if len(out) > maxDecoded {
+		return nil, modType, modSize, fmt.Errorf("decompressed module exceeds %d bytes; refusing", maxDecoded)
 	}
 	return out, modType, modSize, nil
 }
