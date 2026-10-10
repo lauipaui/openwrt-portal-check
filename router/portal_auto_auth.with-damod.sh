@@ -16,10 +16,24 @@ session_interval_file="$base_dir/portal-session.interval"
 helper_bin=${PORTAL_CIPHER_HELPER:-"$base_dir/cipher-helper"}
 export PORTAL_CIPHER_HELPER="$helper_bin"
 runtime_dir=$(mktemp -d "${TMPDIR:-/tmp}/portal-auto.XXXXXX") || exit 1
-lock_dir="$base_dir/.portal-auto-auth.lock"
+# The lock lives on tmpfs so a power loss or SIGKILL cannot leave a stale lock
+# behind to be matched against a recycled PID after the next boot.
+lock_root=${PORTAL_LOCK_ROOT:-/var/run}
+[ -d "$lock_root" ] && [ -w "$lock_root" ] || lock_root=$base_dir
+lock_dir="$lock_root/portal-auto-auth.lock"
 lock_pid_file="$lock_dir/pid"
 probe_file="$runtime_dir/probe"
 probe_url=${PORTAL_PROBE_URL:-http://connect.rom.miui.com/generate_204}
+# Independent HTTP-204 probes tried when the primary one fails, so an outage of
+# a single probe site is not mistaken for a captive portal (which would trigger
+# needless re-authentication). A user-chosen PORTAL_PROBE_URL disables the
+# built-in defaults; PORTAL_PROBE_FALLBACK_URLS="" disables fallbacks entirely.
+if [ -n "${PORTAL_PROBE_URL:-}" ]; then
+    probe_fallback_urls=${PORTAL_PROBE_FALLBACK_URLS-}
+else
+    probe_fallback_urls=${PORTAL_PROBE_FALLBACK_URLS-http://connectivitycheck.platform.hicloud.com/generate_204 http://wifi.vivo.com.cn/generate_204}
+fi
+probe_degraded=0
 probe_interval=${PORTAL_PROBE_SECONDS:-60}
 probe_timeout=${PORTAL_PROBE_TIMEOUT_SECONDS:-10}
 post_auth_delay=${PORTAL_POST_AUTH_DELAY_SECONDS:-3}
@@ -81,6 +95,26 @@ validate_delays() {
     [ "$retry_delay_max" -le 3600 ] || retry_delay_max=3600
     case "$portal_refresh_interval" in ''|*[!0-9]*|0) portal_refresh_interval=300 ;; esac
     [ "$portal_refresh_interval" -ge 60 ] || portal_refresh_interval=60
+    validate_probe_urls
+}
+
+# Keep only plain http(s) URLs made of safe characters; no glob characters can
+# survive, so the later unquoted word splitting of the list is safe.
+validate_probe_urls() {
+    set -f
+    kept_probe_urls=''
+    for candidate_probe_url in $probe_fallback_urls; do
+        case "$candidate_probe_url" in
+            http://*|https://*) ;;
+            *) continue ;;
+        esac
+        case "$candidate_probe_url" in
+            *[!A-Za-z0-9._~:/%+=-]*) continue ;;
+        esac
+        kept_probe_urls="$kept_probe_urls $candidate_probe_url"
+    done
+    set +f
+    probe_fallback_urls=$kept_probe_urls
 }
 
 check_probe_tool() {
@@ -89,6 +123,15 @@ check_probe_tool() {
 
 session_available() {
     [ -s "$session_ticket_file" ] && [ -s "$session_keep_url_file" ]
+}
+
+# True only if PID $1 is alive and still looks like this script; a recycled PID
+# that now belongs to an unrelated process must not block startup.
+lock_holder_alive() {
+    [ "$1" != "$$" ] || return 1
+    kill -0 "$1" 2>/dev/null || return 1
+    [ -r "/proc/$1/cmdline" ] || return 0
+    tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null | grep -q 'portal_auto_auth'
 }
 
 acquire_lock() {
@@ -101,7 +144,7 @@ acquire_lock() {
     case "$lock_pid" in
         ''|*[!0-9]*) ;;
         *)
-            if kill -0 "$lock_pid" 2>/dev/null; then
+            if lock_holder_alive "$lock_pid"; then
                 log_message "Another portal auto-auth process is already running with PID $lock_pid."
                 return 1
             fi
@@ -242,8 +285,27 @@ keep_alive() {
     sh "$client" "$config" keep
 }
 
+# Online if the primary probe, or any independent fallback probe, returns a
+# strict HTTP 204. A captive portal intercepts every plain-HTTP probe, so a
+# fallback can only succeed when the session really has internet access.
 probe_online() {
-    "$helper_bin" probe "$probe_url" "$probe_timeout" >/dev/null 2>&1
+    if "$helper_bin" probe "$probe_url" "$probe_timeout" >/dev/null 2>&1; then
+        if [ "$probe_degraded" -eq 1 ]; then
+            probe_degraded=0
+            log_message 'Primary connectivity probe recovered.'
+        fi
+        return 0
+    fi
+    for fallback_probe_url in $probe_fallback_urls; do
+        if "$helper_bin" probe "$fallback_probe_url" "$probe_timeout" >/dev/null 2>&1; then
+            if [ "$probe_degraded" -eq 0 ]; then
+                probe_degraded=1
+                log_message 'Primary connectivity probe failed but a fallback probe returned 204; session treated as online.'
+            fi
+            return 0
+        fi
+    done
+    return 1
 }
 
 verify_online_with_retries() {

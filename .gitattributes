@@ -1,0 +1,5 @@
+# Router-side scripts and their tests run under BusyBox/POSIX sh and must stay LF,
+# even when the repository is checked out on Windows with core.autocrlf=true.
+*.sh text eol=lf
+*.cjs text eol=lf
+router/* text eol=lf

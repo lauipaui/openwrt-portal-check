@@ -1,0 +1,207 @@
+#!/bin/sh
+# OpenWrt campus-network health and captive-portal detector.
+# This script is deliberately read-only: it never changes network or portal state.
+
+set -u
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+WAN_IF=${CAMPUS_CHECK_IFACE:-wan}
+PROBE_URL=${CAMPUS_CHECK_URL:-http://connect.rom.miui.com/generate_204}
+# Tried in order when the primary probe fails outright (not when it is answered
+# with a portal page), so one probe site being down is not reported as an
+# outage. An explicit CAMPUS_CHECK_URL disables the built-in defaults.
+if [ -n "${CAMPUS_CHECK_URL:-}" ]; then
+    FALLBACK_URLS=${CAMPUS_CHECK_FALLBACK_URLS-}
+else
+    FALLBACK_URLS=${CAMPUS_CHECK_FALLBACK_URLS-http://connectivitycheck.platform.hicloud.com/generate_204 http://wifi.vivo.com.cn/generate_204}
+fi
+INTERVAL=${CAMPUS_CHECK_INTERVAL:-60}
+TIMEOUT=${CAMPUS_CHECK_TIMEOUT:-8}
+STATE_FILE=${CAMPUS_CHECK_STATE_FILE:-/tmp/campus-check.state}
+STATUS_FILE=${CAMPUS_CHECK_STATUS_FILE:-/tmp/campus-check.status}
+BODY_FILE=/tmp/campus-check.body.$$
+LOG_TAG=campus-check
+
+cleanup() {
+    rm -f "$BODY_FILE" "$STATUS_FILE.tmp.$$" "$STATE_FILE.tmp.$$"
+}
+
+handle_signal() {
+    cleanup
+    exit 0
+}
+
+trap cleanup EXIT
+trap handle_signal HUP INT TERM
+
+log_message() {
+    logger -t "$LOG_TAG" "$*" 2>/dev/null || printf '%s\n' "$*" >&2
+}
+
+first_ipv4() {
+    ip -4 -o addr show dev "$WAN_IF" scope global 2>/dev/null |
+        awk 'NR == 1 { split($4, a, "/"); print a[1]; exit }'
+}
+
+default_gateway() {
+    ip route show default dev "$WAN_IF" 2>/dev/null |
+        awk '$1 == "default" { for (i = 1; i <= NF; i++) if ($i == "via") { print $(i + 1); exit } }'
+}
+
+wan_dns() {
+    awk -v iface="$WAN_IF" '
+        $0 == "# Interface " iface { inside = 1; next }
+        inside && /^# Interface / { exit }
+        inside && /^nameserver / { print $2; exit }
+    ' /tmp/resolv.conf.d/resolv.conf.auto 2>/dev/null
+}
+
+write_status() {
+    state=$1
+    detail=$2
+    ipv4=$3
+    gateway=$4
+    dns=$5
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S %z' 2>/dev/null || date)
+
+    {
+        printf 'state=%s\n' "$state"
+        printf 'timestamp=%s\n' "$timestamp"
+        printf 'interface=%s\n' "$WAN_IF"
+        printf 'ipv4=%s\n' "$ipv4"
+        printf 'gateway=%s\n' "$gateway"
+        printf 'dns=%s\n' "$dns"
+        printf 'probe_url=%s\n' "$PROBE_URL"
+        printf 'detail=%s\n' "$detail"
+    } > "$STATUS_FILE.tmp.$$" || return 1
+    chmod 644 "$STATUS_FILE.tmp.$$" 2>/dev/null || true
+    mv -f "$STATUS_FILE.tmp.$$" "$STATUS_FILE"
+
+    previous=''
+    [ -r "$STATE_FILE" ] && previous=$(sed -n '1p' "$STATE_FILE")
+    if [ "$previous" != "$state" ]; then
+        log_message "state=$state interface=$WAN_IF ipv4=${ipv4:-none} gateway=${gateway:-none} dns=${dns:-none} detail=$detail"
+    fi
+    printf '%s\n' "$state" > "$STATE_FILE.tmp.$$" || return 1
+    chmod 600 "$STATE_FILE.tmp.$$" 2>/dev/null || true
+    mv -f "$STATE_FILE.tmp.$$" "$STATE_FILE"
+}
+
+finish() {
+    state=$1
+    detail=$2
+    ipv4=${3:-}
+    gateway=${4:-}
+    dns=${5:-}
+    write_status "$state" "$detail" "$ipv4" "$gateway" "$dns" || true
+    if [ "${CAMPUS_CHECK_QUIET:-0}" != 1 ]; then
+        printf 'state=%s detail=%s ipv4=%s gateway=%s dns=%s\n' \
+            "$state" "$detail" "${ipv4:-none}" "${gateway:-none}" "${dns:-none}"
+    fi
+    [ "$state" = ONLINE ]
+}
+
+run_once() {
+    ipv4=$(first_ipv4)
+    [ -n "$ipv4" ] || finish WAN_DOWN no_ipv4 "" "" "" || return 1
+
+    gateway=$(default_gateway)
+    [ -n "$gateway" ] || finish ROUTE_DOWN no_default_gateway "$ipv4" "" "" || return 1
+
+    if ! ping -I "$WAN_IF" -c 1 -W 2 "$gateway" >/dev/null 2>&1; then
+        finish GATEWAY_DOWN gateway_ping_failed "$ipv4" "$gateway" "" || return 1
+    fi
+
+    dns=$(wan_dns)
+    [ -n "$dns" ] || dns=127.0.0.1
+    if ! nslookup -timeout=3 -retry=1 openwrt.org "$dns" 2>/dev/null | grep -q '^Name:'; then
+        finish DNS_DOWN dns_lookup_failed "$ipv4" "$gateway" "$dns" || return 1
+    fi
+
+    command -v wget >/dev/null 2>&1 || {
+        finish CHECKER_ERROR wget_not_found "$ipv4" "$gateway" "$dns" || return 1
+    }
+
+    rm -f "$BODY_FILE"
+    online_detail=http_204_empty_body
+    if ! wget -4 -T "$TIMEOUT" -O "$BODY_FILE" "$PROBE_URL" >/dev/null 2>&1; then
+        probe_ok=0
+        set -f
+        for fallback_url in $FALLBACK_URLS; do
+            case "$fallback_url" in
+                http://*|https://*) ;;
+                *) continue ;;
+            esac
+            case "$fallback_url" in
+                *[!A-Za-z0-9._~:/%+=-]*) continue ;;
+            esac
+            rm -f "$BODY_FILE"
+            if wget -4 -T "$TIMEOUT" -O "$BODY_FILE" "$fallback_url" >/dev/null 2>&1; then
+                probe_ok=1
+                online_detail=http_204_empty_body_via_fallback
+                break
+            fi
+        done
+        set +f
+        if [ "$probe_ok" -ne 1 ]; then
+            finish INTERNET_DOWN http_probe_failed "$ipv4" "$gateway" "$dns" || return 1
+        fi
+    fi
+
+    body_size=$(wc -c < "$BODY_FILE" 2>/dev/null | tr -d '[:space:]')
+    case "$body_size" in
+        ''|*[!0-9]*) body_size=0 ;;
+    esac
+
+    if [ "$body_size" -eq 0 ]; then
+        finish ONLINE "$online_detail" "$ipv4" "$gateway" "$dns"
+        return $?
+    fi
+
+    if grep -qiE '天翼校园网|captive[ -]portal|/qs/|输入你的登录|输入你的密码' "$BODY_FILE" 2>/dev/null; then
+        finish CAPTIVE_PORTAL portal_login_page "$ipv4" "$gateway" "$dns" || return 1
+    fi
+
+    finish HTTP_UNEXPECTED "non_empty_probe_body_${body_size}_bytes" "$ipv4" "$gateway" "$dns" || return 1
+}
+
+show_status() {
+    if [ -r "$STATUS_FILE" ]; then
+        cat "$STATUS_FILE"
+    else
+        echo 'state=UNKNOWN'
+        return 1
+    fi
+}
+
+validate_number() {
+    case "$1" in
+        ''|*[!0-9]*) return 1 ;;
+        *) [ "$1" -gt 0 ] ;;
+    esac
+}
+
+case "${1:-once}" in
+    once|check)
+        run_once
+        ;;
+    status)
+        show_status
+        ;;
+    watch)
+        validate_number "$INTERVAL" || INTERVAL=60
+        [ "$INTERVAL" -ge 15 ] || INTERVAL=15
+        CAMPUS_CHECK_QUIET=1
+        export CAMPUS_CHECK_QUIET
+        while :; do
+            run_once || true
+            sleep "$INTERVAL"
+        done
+        ;;
+    *)
+        echo "Usage: $0 [once|check|status|watch]" >&2
+        exit 2
+        ;;
+esac
