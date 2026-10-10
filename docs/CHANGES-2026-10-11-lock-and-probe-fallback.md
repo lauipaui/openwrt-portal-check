@@ -43,6 +43,27 @@ procd 的 `respawn 3600 5 5` 重试 5 次后永久放弃，之后没有任何东
 **代价**：真正断网（所有探针都超时）时，一次探测最长耗时由 1×超时 变为 3×超时（默认 10s → 30s）。
 被门户 302 拦截时应答是即时的，不受影响。
 
+## 3. 看门狗（procd 放弃监管时兜底）
+
+校园网会话 **1 小时不续就断**。服务器下发的保活间隔是 900 秒（每小时 4 次），脚本最长退避 300 秒，
+正常故障都在余量之内。唯一没有兜底的是：`portal-auto-auth` 的 init 用 `respawn 3600 5 5`，
+一小时内异常退出 5 次后 procd 永久放弃，之后没人续会话，网络一小时内必断且不会自愈。
+
+`router/portal-watchdog`（安装到 `/usr/sbin/portal-watchdog`），cron 每 10 分钟运行一次：
+
+```
+*/10 * * * * /usr/sbin/portal-watchdog
+```
+
+- 只在“服务已 enable 但 procd 报告没在运行”时执行 `restart`；运行中、或被人为 disable，一律不动。
+- 冷却时间 600 秒（`WATCHDOG_COOLDOWN_SECONDS`），避免崩溃循环里反复重新认证；时钟回拨产生的“未来时间戳”不会把它永久卡住。
+- 暂停：`touch /var/run/portal-watchdog.disabled`（tmpfs，重启自动清除）。
+- 日志标签 `portal-watchdog`：`... enabled but not running; restarting it.` / `... restarted.`
+- 范围：只覆盖“进程没了”。进程活着但卡死不在覆盖内；`campus-check` 是只读诊断，也不监管。
+
+验证：`tests/watchdog.sh`（桩 init，9 个场景，6 种变异均被抓住）；另在路由器真实 procd 上用临时假服务
+（`respawn 3600 5 5`）连杀 6 次让 procd 放弃，再运行看门狗，服务被拉起，冷却期内不重复重启。
+
 ## 已知限制
 
 - `candidate-activate`（算法/端点迁移时的候选验证）仍只用主探测地址：它在认证之后才探测，
@@ -58,6 +79,7 @@ sh tests/backoff.sh
 sh tests/state-transition.sh
 sh tests/probe-fallback.sh      # 新增：默认/显式地址/列表校验/恢复日志
 sh tests/lock.sh                # 新增：tmpfs 路径、陈旧锁、PID 回收、活跃持有者、回退目录
+sh tests/watchdog.sh            # 新增：看门狗的重启条件、冷却、暂停、disable、时钟回拨
 node tests/regression.cjs
 ```
 

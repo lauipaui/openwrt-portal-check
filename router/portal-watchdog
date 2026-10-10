@@ -1,0 +1,47 @@
+#!/bin/sh
+# Last-resort supervisor for portal-auto-auth. procd stops respawning a service
+# that exits too often (respawn 3600 5 5), after which nothing renews the portal
+# session and the campus network drops within an hour. Run from cron every
+# 10 minutes: it only acts when the service is enabled but not running.
+#
+#   touch /var/run/portal-watchdog.disabled   # pause (cleared by reboot)
+set -u
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+SERVICE=${WATCHDOG_SERVICE:-portal-auto-auth}
+INIT=${WATCHDOG_INIT:-/etc/init.d/$SERVICE}
+STAMP=${WATCHDOG_STAMP:-/var/run/portal-watchdog.last}
+DISABLE_FILE=${WATCHDOG_DISABLE_FILE:-/var/run/portal-watchdog.disabled}
+COOLDOWN=${WATCHDOG_COOLDOWN_SECONDS:-600}
+LOG_TAG=portal-watchdog
+
+log_message() {
+    logger -t "$LOG_TAG" "$*" 2>/dev/null || printf '%s\n' "$*"
+}
+
+case "$COOLDOWN" in ''|*[!0-9]*) COOLDOWN=600 ;; esac
+
+[ ! -e "$DISABLE_FILE" ] || exit 0
+[ -x "$INIT" ] || exit 0
+# A deliberately disabled service must stay down.
+"$INIT" enabled >/dev/null 2>&1 || exit 0
+"$INIT" running >/dev/null 2>&1 && exit 0
+
+now=$(date +%s)
+last=0
+[ ! -r "$STAMP" ] || last=$(sed -n '1p' "$STAMP")
+case "$last" in ''|*[!0-9]*) last=0 ;; esac
+if [ "$last" -le "$now" ] && [ $((now - last)) -lt "$COOLDOWN" ]; then
+    exit 0
+fi
+
+printf '%s\n' "$now" > "$STAMP"
+log_message "$SERVICE is enabled but not running; restarting it."
+if "$INIT" restart >/dev/null 2>&1; then
+    log_message "$SERVICE restarted."
+    exit 0
+fi
+log_message "Restart of $SERVICE failed."
+exit 1
