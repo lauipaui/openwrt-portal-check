@@ -9,7 +9,9 @@ $Output = Join-Path $Root "dist\cipher-helper-mipsle"
 if (-not (Test-Path $Go)) { throw "Go toolchain not found at $Go" }
 
 $env:GOPATH      = "C:\Users\plaui\Documents\Codex\tools\gopath"
-$env:GOFLAGS     = "-mod=mod"
+$env:GOFLAGS     = "-mod=readonly"
+$env:GOPROXY = "off"
+$env:GOSUMDB = "off"
 $env:CGO_ENABLED = "0"
 $env:GOOS        = "linux"
 $env:GOARCH      = "mipsle"
@@ -27,4 +29,4 @@ try {
 $item = Get-Item $Output
 Write-Host ("built {0} ({1:N0} bytes)" -f $item.FullName, $item.Length)
 Write-Host "deploy:  scp -O $Output root@192.168.1.1:/root/portal/cipher-helper"
-Write-Host "verify:  ssh root@192.168.1.1 'chmod 700 /root/portal/cipher-helper; /root/portal/cipher-helper list'"
+Write-Host "list only reports capability; verify configuration readiness with cipher-helper client CONFIG self-test."

@@ -5,92 +5,66 @@ import (
 	"strings"
 )
 
-// NewCipherRaw builds a cipher straight from an unpacked DaMod module: the
-// template name recorded in the module's .dynstr plus the key/IV the module
-// embeds in .data.  The portal hands out the current module on demand, so this
-// lets the OpenWrt client follow an algorithm rotation without recompiling
-// cipher-helper - only the key material changes.
-//
-// The template name carries the primitive and the key length carries the
-// layering, which is how the module's own metadata block is laid out:
-//
-//	block size (meta[0]) = 8 for DES, 16 for AES
-//	key length (meta[2]) = 48 double-3DES / six-layer DES, 32 double-AES
-//	key offset (meta[5]) = start of the key inside .data, IV follows it
-func NewCipherRaw(template string, key, iv []byte) (Cipher, error) {
-	tpl := strings.ToLower(strings.TrimSpace(template))
-	has := func(s string) bool { return strings.Contains(tpl, s) }
-
-	switch {
-	case has("aes") && has("cbc"):
-		switch len(key) {
-		case 32:
-			if len(iv) < 16 {
-				return nil, fmt.Errorf("aes-cbc: need a 16-byte IV, got %d", len(iv))
-			}
-			return NewAESDoubleCBCAndroid(key, iv), nil
-		case 16:
-			if len(iv) < 16 {
-				return nil, fmt.Errorf("aes-cbc: need a 16-byte IV, got %d", len(iv))
-			}
-			return NewAESCBC(key, key, iv), nil
+// Templates are protocol identifiers, never substring guesses. DES16 is rejected:
+// no verified protocol vector establishes two-key 3DES semantics for that module.
+func NewCipherRaw(template string, key, iv []byte) (c Cipher, err error) {
+	defer func() {
+		if recover() != nil {
+			c = nil
+			err = fmt.Errorf("invalid raw cipher parameters")
 		}
-		return nil, fmt.Errorf("aes-cbc: unsupported key length %d", len(key))
-
-	case has("aes") && has("ecb"):
-		switch len(key) {
-		case 32:
-			return NewAESDoubleECBAndroid(key), nil
-		case 16:
-			return NewAESECB(key, key), nil
+	}()
+	k := func(n ...int) bool { return bytesReady(key, true, n...) }
+	v := func(n int) bool { return len(iv) == n }
+	switch strings.ToLower(template) {
+	case "tpl_aes_cbc.so":
+		if !v(16) {
+			break
 		}
-		return nil, fmt.Errorf("aes-ecb: unsupported key length %d", len(key))
-
-	case has("des") && has("cbc"), has("des") && has("iv"):
-		switch len(key) {
-		case 48:
-			if len(iv) < 16 {
-				return nil, fmt.Errorf("3des-cbc: need a 16-byte IV, got %d", len(iv))
-			}
-			return NewDESedeDoubleCBCAndroid(key, iv), nil
-		case 24:
-			if len(iv) < 8 {
-				return nil, fmt.Errorf("3des-cbc: need an 8-byte IV, got %d", len(iv))
-			}
-			return NewDESedeCBC(key, key, iv), nil
+		if k(32) {
+			c = NewAESDoubleCBCAndroid(key, iv)
+		} else if k(16) {
+			c = NewAESCBC(key, key, iv)
 		}
-		return nil, fmt.Errorf("3des-cbc: unsupported key length %d", len(key))
-
-	case has("des") && has("ecb"):
-		switch len(key) {
-		case 48:
-			return NewDESECBSix(key), nil
-		case 16:
-			return NewDESedeECB(key, key), nil
+	case "tpl_aes_ecb.so":
+		if k(32) {
+			c = NewAESDoubleECBAndroid(key)
+		} else if k(16) {
+			c = NewAESECB(key, key)
 		}
-		return nil, fmt.Errorf("des-ecb: unsupported key length %d", len(key))
-
-	case has("sm4") && has("cbc"):
-		if len(iv) < 16 {
-			return nil, fmt.Errorf("sm4-cbc: need a 16-byte IV, got %d", len(iv))
+	case "tpl_des_iv.so", "tpl_des_cbc.so":
+		if k(48) && v(16) {
+			c = NewDESedeDoubleCBCAndroid(key, iv)
+		} else if k(24) && v(8) {
+			c = NewDESedeCBC(key, key, iv)
 		}
-		return NewSM4VariantCBC(key, iv), nil
-
-	case has("sm4") && has("ecb"):
-		return NewSM4VariantECB(key), nil
-
-	case has("zuc"):
-		if len(iv) < 16 {
-			return nil, fmt.Errorf("zuc: need a 16-byte IV, got %d", len(iv))
+	case "tpl_des.so", "tpl_des_ecb.so":
+		if k(48) {
+			c = NewDESECBSix(key)
+		} else if k(24) {
+			c = NewDESedeECB(key, key)
 		}
-		return NewZUC(key, iv), nil
-
-	case has("snow3g"):
-		if len(iv) < 16 {
-			return nil, fmt.Errorf("snow3g: need a 16-byte IV, got %d", len(iv))
+	case "tpl_sm4_cbc.so":
+		if k(16) && v(16) {
+			c = NewSM4VariantCBC(key, iv)
 		}
-		return NewSnow3gVariant(key, iv), nil
+	case "tpl_sm4_ecb.so":
+		if k(16) {
+			c = NewSM4VariantECB(key)
+		}
+	case "tpl_zuc.so":
+		if k(16) && v(16) {
+			c = NewZUC(key, iv)
+		}
+	case "tpl_snow3g.so":
+		if k(16) && v(16) {
+			c = NewSnow3gVariant(key, iv)
+		}
+	default:
+		return nil, fmt.Errorf("unsupported module template")
 	}
-
-	return nil, fmt.Errorf("unsupported module template %q (key=%d iv=%d)", template, len(key), len(iv))
+	if c == nil {
+		return nil, fmt.Errorf("invalid or unavailable key/IV for template %s", template)
+	}
+	return guarded{c}, nil
 }
