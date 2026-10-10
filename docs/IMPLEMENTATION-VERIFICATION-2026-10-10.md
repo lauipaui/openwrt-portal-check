@@ -72,7 +72,9 @@ CGO_ENABLED=0、GOOS=linux、GOARCH=mipsle、GOMIPS=softfloat，使用go build -
 - 主线程独立重跑两模块 test/vet、两脚本 sh -n、backoff/state-transition、Node 端到端回归及 git diff --check，结果为 MAIN_FINAL_REGRESSION_ALL_PASS。
 - 两个 fuzz 短跑通过：ELF section table 1074 次、untrusted container 19558 次。
 - 最终 mipsle 产物已在 OpenWrt 私有暂存目录按 release.sha256 校验；真实旧配置 self-test、真实模块 key/IV 与旧 damod 对照、候选 self-test、Linux 软链接拒绝、真实 keep、严格 HTTP204 与独立 HTTPS204 全部通过。
-- 最终暂存验收标记为 FINAL_STAGE_ALL_PASS_PRODUCTION_UNCHANGED；生产文件和服务在暂存阶段未改变。正式切换仍须单独执行新鲜备份、原子替换、真实 auth/keep/204 验证及失败回滚。
+- 最终暂存验收标记为 FINAL_STAGE_ALL_PASS_PRODUCTION_UNCHANGED；生产切换已执行并完成新鲜备份、原子替换、真实 auth、严格 HTTP204、独立 HTTPS204、新服务启动和首次 keep 验证。
+- 切换后生产哈希：`portal_auto_auth.sh` 3f75b5e4…；`portal_client_openssl.sh` 54160843…；`cipher-helper` cee290d3…；`damod` 01198e84…。完整哈希见本报告及设备 release.sha256。
+- 新鲜备份：`/root/portal-backups/20261010-cutover-171526`；`backup.ready`、`deploy.confirmed` 存在，无 `rollback.result`，账号/密码与备份逐字节一致，配置文件权限 0600。
 - 跨多个配置/会话文件不是断电原子事务；硬断电/SIGKILL发布中途需部署备份恢复。候选认证对运营商远端旧会话的影响不能靠本地回滚保证。
 - 用户手工编辑应停服务；最终比较与rename之间仍有无法消除的非协作编辑竞态。遇到外部变化不覆盖用户值，必要时报告不完整回滚。
 - 原协议HTTP模块没有新增签名，白名单不消除链路MITM；未知类型/模板拒绝自动启用。
