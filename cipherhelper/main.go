@@ -6,7 +6,6 @@ package main
 import (
 	"encoding/hex"
 	"fmt"
-	"io"
 	"os"
 	"strings"
 
@@ -17,11 +16,14 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "usage: cipher-helper <encrypt|decrypt|check|list> [algo-id]")
 	fmt.Fprintln(os.Stderr, "  encrypt <algo-id>  read plaintext on stdin, write uppercase hex to stdout")
 	fmt.Fprintln(os.Stderr, "  decrypt <algo-id>  read hex on stdin, write plaintext to stdout")
-	fmt.Fprintln(os.Stderr, "  check   <algo-id>  exit 0 when the algorithm is supported")
+	fmt.Fprintln(os.Stderr, "  check   <algo-id>  exit 0 only when the algorithm and loaded key material are ready")
 	fmt.Fprintln(os.Stderr, "  list               print every supported algorithm ID")
 	fmt.Fprintln(os.Stderr, "")
 	fmt.Fprintln(os.Stderr, "  encrypt-raw <template> <keyhex> [ivhex]   (same as encrypt, key material from a DaMod module)")
 	fmt.Fprintln(os.Stderr, "  decrypt-raw <template> <keyhex> [ivhex]   (same as decrypt, key material from a DaMod module)")
+	fmt.Fprintln(os.Stderr, "  client <config> <ticket|auth|keep|self-test>  safe protocol client")
+	fmt.Fprintln(os.Stderr, "  probe <url> <timeout-seconds>              strict no-redirect HTTP 204")
+	fmt.Fprintln(os.Stderr, "  config-get|config-set|config-normalize|candidate-prepare|candidate-activate (see docs/SECURITY-2026-10-10.md)")
 	os.Exit(2)
 }
 
@@ -41,7 +43,7 @@ func stripSpace(s string) string {
 }
 
 func readStdin() string {
-	data, err := io.ReadAll(os.Stdin)
+	data, err := readLimited(os.Stdin, responseLimit)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "cipher-helper: cannot read stdin: %v\n", err)
 		os.Exit(1)
@@ -101,6 +103,13 @@ func runRaw(encrypt bool) {
 }
 
 func main() {
+	if handled, err := portalCommand(os.Args[1:]); handled {
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "cipher-helper: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if len(os.Args) < 2 {
 		usage()
 	}
