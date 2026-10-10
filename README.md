@@ -6,6 +6,14 @@ OpenWrt 校园网（CNDATA / 天翼校园）门户自动认证的研究记录与
 就得跟着换。这个仓库记录了**怎么发现算法变更、怎么把新算法模块拆开、怎么把里面
 的密钥取出来**，以及配套的工具。
 
+## 2026-10-10 安全实现
+
+新调度器已接通 **受限数据配置 → 模块验证 → 候选 raw 认证 → 独立 HTTP204 → 配置/会话激活 → 保活**。
+无私有静态密钥的公开构建会安全拒绝check/encrypt；list不代表就绪。
+必须一起部署新helper、damod和两个脚本。旧单引号配置按数据兼容，更新规范化为JSON，网络内容绝不source/eval。
+
+部署接口、信任白名单、回滚边界和公开回归见 [安全修复说明](docs/SECURITY-2026-10-10.md)。
+
 ## 关键结论
 
 **门户会把当前算法模块主动下发，模块里带明文密钥。**
@@ -72,7 +80,7 @@ docs/             Runbook 与部署记录
 
 ```sh
 damod <module.bin>            # 人类可读
-damod -env <module.bin>       # shell 变量（DAMOD_UUID/TEMPLATE/KEY/IV...）
+damod -env <module.bin>       # 旧数据导出，禁止source网络派生输出；新调度器用-json（DAMOD_UUID/TEMPLATE/KEY/IV...）
 damod -json <module.bin>      # JSON
 damod -o out.so <module.bin>  # 顺便把还原出的 ELF 落盘
 ```
@@ -131,19 +139,19 @@ func init() {
 或者：
 
 ```sh
-damod -env /root/portal/damod-update.bin.<UUID>
-cipher-helper encrypt-raw tpl_des_iv.so "$DAMOD_KEY" "$DAMOD_IV"
+damod -json /root/portal/damod-update.bin.<UUID> > private-module.json
+# 新调度器通过候选数据配置加载，禁止source/eval下载的配置。
 ```
 
 ## 门户换算法时的流程
 
-1. 路由器脚本用全零 UUID 探测，发现 `ALGO_ID` 与门户当前不一致
-2. 把模块存到 `damod-update.bin.<新UUID>`
-3. 调 `damod -env` 解包，写 `algo-<新UUID>.env`
-4. 报告模板名和 key 长度，并用 `cipher-helper encrypt-raw` 试跑，判定"已支持 / 需要新实现"
-5. 已支持 → 改配置里的 `ALGO_ID` / `CIPHER_SCHEME` 即可
+1. 私有临时目录下载新模块，下载/容器/UUID/解压/节表/模板校验失败关闭。
+2. 使用 `damod -json` 制作候选参数，验证能力及加解密；不信任旧非空缓存。
+3. 候选 `ALGO_ID` 与 raw key/IV 直接进入 ticket/auth 请求，真实认证且严格 HTTP204 成功后才激活。
+4. 成功后进入保活；失败不改活动配置与本地会话；写入错误按已持有的状态回滚，保留并发外部编辑。
+5. 未知模板/容器类型不会自动启用。多文件断电回滚仍需部署备份。
 
-细节见 `docs/RUNBOOK-算法变更处理.md`。
+历史分析见 `docs/RUNBOOK-算法变更处理.md`；当前执行步骤与测试以 [安全修复说明](docs/SECURITY-2026-10-10.md) 为准。
 
 ## 已知限制
 

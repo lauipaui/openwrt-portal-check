@@ -12,7 +12,7 @@ type Cipher interface {
 }
 
 // NewCipher creates a cipher instance for the given algorithm ID.
-func NewCipher(algoID string) (Cipher, error) {
+func buildCipher(algoID string) (Cipher, error) {
 	upperAlgoID := strings.ToUpper(algoID)
 	switch upperAlgoID {
 	// -----------------------------------------------------------------
@@ -103,4 +103,42 @@ func NewCipher(algoID string) (Cipher, error) {
 	default:
 		return nil, fmt.Errorf("unknown algorithm: %s", algoID)
 	}
+}
+
+// NewCipher refuses unloaded keys before constructing any primitive.
+func NewCipher(id string) (c Cipher, err error) {
+	defer func() {
+		if recover() != nil {
+			c = nil
+			err = fmt.Errorf("invalid cipher parameters")
+		}
+	}()
+	if err = keyReady(id); err != nil {
+		return nil, err
+	}
+	c, err = buildCipher(id)
+	if err != nil {
+		return nil, err
+	}
+	return guarded{c}, nil
+}
+
+// Malformed ciphertext is an error (empty result), not a process panic.
+type guarded struct{ Cipher }
+
+func (g guarded) Encrypt(s string) (out string) {
+	defer func() {
+		if recover() != nil {
+			out = ""
+		}
+	}()
+	return g.Cipher.Encrypt(s)
+}
+func (g guarded) Decrypt(s string) (out string) {
+	defer func() {
+		if recover() != nil {
+			out = ""
+		}
+	}()
+	return g.Cipher.Decrypt(s)
 }

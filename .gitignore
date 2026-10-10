@@ -25,3 +25,8 @@ node_modules/
 # 其他
 .DS_Store
 Thumbs.db
+# Private state locks and bounded runtime staging
+.portal-state.lock
+.portal-state.lockdir/
+.portal-auto-auth.lock/
+.portal-*

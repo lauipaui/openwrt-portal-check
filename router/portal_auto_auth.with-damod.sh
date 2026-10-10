@@ -1,6 +1,9 @@
 #!/bin/sh
 # Keep a CNDATA portal session alive with protocol keep-alives and fast recovery.
 set -u
+umask 077
+export PORTAL_TIME_OFFSET="$(date +%z)"
+export GOMEMLIMIT=${GOMEMLIMIT:-6MiB}
 
 base_dir=${PORTAL_BASE_DIR:-/root/portal}
 client="$base_dir/portal_client_openssl.sh"
@@ -10,9 +13,12 @@ password_file="$base_dir/portal.password"
 session_ticket_file="$base_dir/portal-session.ticket"
 session_keep_url_file="$base_dir/portal-session.keep-url"
 session_interval_file="$base_dir/portal-session.interval"
-lock_dir=/tmp/portal-auto-auth.lock
+helper_bin=${PORTAL_CIPHER_HELPER:-"$base_dir/cipher-helper"}
+export PORTAL_CIPHER_HELPER="$helper_bin"
+runtime_dir=$(mktemp -d "${TMPDIR:-/tmp}/portal-auto.XXXXXX") || exit 1
+lock_dir="$base_dir/.portal-auto-auth.lock"
 lock_pid_file="$lock_dir/pid"
-probe_file=/tmp/portal-auto-auth.probe.$$
+probe_file="$runtime_dir/probe"
 probe_url=${PORTAL_PROBE_URL:-http://connect.rom.miui.com/generate_204}
 probe_interval=${PORTAL_PROBE_SECONDS:-60}
 probe_timeout=${PORTAL_PROBE_TIMEOUT_SECONDS:-10}
@@ -22,9 +28,9 @@ default_keep_interval=${PORTAL_KEEP_SECONDS:-300}
 retry_delay=${PORTAL_RETRY_SECONDS:-60}
 retry_delay_max=${PORTAL_RETRY_MAX_SECONDS:-300}
 portal_refresh_interval=${PORTAL_REFRESH_SECONDS:-300}
-portal_page_file=/tmp/portal-auto-auth.page.$$
-algo_probe_file=/tmp/portal-auto-auth.algo.$$
-algo_probe_request_file=/tmp/portal-auto-auth.algo-request.$$
+portal_page_file="$runtime_dir/page"
+algo_probe_file="$runtime_dir/module"
+algo_probe_request_file="$runtime_dir/request"
 consecutive_failures=0
 last_portal_refresh=''
 export PORTAL_SESSION_TICKET_FILE="$session_ticket_file"
@@ -53,19 +59,10 @@ current_wan_ip() {
 refresh_wan_ip() {
     new_ip=$(current_wan_ip)
     case "$new_ip" in ''|*[!0-9.]*) return 1 ;; esac
-    old_ip=$(sed -n "s/^IPV4='\{0,1\}\([0-9.]*\)'\{0,1\}$/\1/p" "$config" | sed -n '1p')
-    [ -n "$old_ip" ] && [ "$old_ip" != "$new_ip" ] || return 1
-    cp -p "$config" "$config.bak-ip-$(date +%Y%m%d-%H%M%S)" || return 1
-    tmp_config="$config.tmp.$$"
-    if sed -e "s/^IPV4=.*/IPV4='$new_ip'/" \
-           -e "s/\([?&]wlanuserip=\)[0-9.]*/\1$new_ip/" \
-           -e "s/\([?&]clientip=\)[0-9.]*/\1$new_ip/" "$config" > "$tmp_config" &&
-        chmod 600 "$tmp_config" && mv "$tmp_config" "$config"; then
-        log_message "WAN IPv4 changed from $old_ip to $new_ip; updated $config and forcing re-authentication."
+    if "$helper_bin" config-wan "$config" "$new_ip" >/dev/null 2>&1; then
+        log_message 'WAN IPv4 changed; safely updated data configuration and forcing re-authentication.'
         return 0
     fi
-    rm -f "$tmp_config"
-    log_message "WAN IPv4 changed from $old_ip to $new_ip, but updating $config failed."
     return 1
 }
 
@@ -87,10 +84,7 @@ validate_delays() {
 }
 
 check_probe_tool() {
-    command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 || {
-        log_message 'No curl or wget is available; refusing to start without a connectivity probe.'
-        return 1
-    }
+    [ -x "$helper_bin" ] || { log_message 'A current cipher-helper is required for strict HTTP probing and safe data parsing.'; return 1; }
 }
 
 session_available() {
@@ -127,7 +121,7 @@ release_lock() {
         rm -f "$lock_pid_file"
         rmdir "$lock_dir" 2>/dev/null
     fi
-    rm -f "$probe_file" "$portal_page_file" "$algo_probe_file" "$algo_probe_request_file"
+    rm -rf "$runtime_dir"
 }
 
 handle_signal() {
@@ -155,63 +149,26 @@ format_time() {
     date -d "@$1" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "epoch $1"
 }
 
-config_value() {
-    sed -n "s/^$1='\{0,1\}\([^']*\)'\{0,1\}$/\1/p" "$config" | sed -n '1p'
+config_value() { "$helper_bin" config-get "$config" "$1"; }
+
+load_credentials() {
+    PORTAL_USER=$(sed -n '1p' "$user_file")
+    PORTAL_PASSWORD=$(sed -n '1p' "$password_file")
+    [ -n "$PORTAL_USER" ] && [ -n "$PORTAL_PASSWORD" ] || return 1
+    export PORTAL_USER PORTAL_PASSWORD
 }
 
-url_without_query() {
-    printf '%s' "$1" | sed -n 's/^\([^?]*\).*$/\1/p'
-}
-
-url_query() {
-    case "$1" in
-        *\?*) printf '?%s' "${1#*\?}" ;;
-        *) printf '' ;;
-    esac
-}
-
-sed_replacement_escape() {
-    printf '%s' "$1" | sed 's/[\\&#]/\\&/g'
-}
-
-extract_cdata_tag() {
-    awk -v tag="$1" '
-        {
-            pattern = "<" tag "><![CDATA["
-            start = index($0, pattern)
-            if (start > 0) {
-                rest = substr($0, start + length(pattern))
-                stop = index(rest, "]]>")
-                if (stop > 0) {
-                    print substr(rest, 1, stop - 1)
-                    exit
-                }
-            }
-        }
-    ' "$2"
+activate_candidate() {
+    load_credentials || { log_message 'Portal credentials are empty.'; return 1; }
+    "$helper_bin" candidate-activate "$config" "$1" "$probe_url" "$probe_timeout" "$post_auth_attempts" "$post_auth_delay"
 }
 
 fetch_portal_page() {
-    page_agent=$(config_value USER_AGENT)
-    [ -n "$page_agent" ] || page_agent='CCTP/android11_64/2104'
-    : > "$portal_page_file" || return 1
-    if command -v curl >/dev/null 2>&1; then
-        curl -fsS --connect-timeout "$probe_timeout" --max-time "$probe_timeout" \
-            -A "$page_agent" -o "$portal_page_file" "$probe_url" >/dev/null 2>&1 || return 1
-    elif command -v wget >/dev/null 2>&1; then
-        wget -q -T "$probe_timeout" -O "$portal_page_file" \
-            --header="User-Agent: $page_agent" "$probe_url" >/dev/null 2>&1 || return 1
-    else
-        return 1
-    fi
-    [ -s "$portal_page_file" ]
+    "$helper_bin" portal-page "$config" "$probe_url" "$portal_page_file"
 }
 
-# Re-read the captive portal configuration page and adopt a migrated ticket/auth
-# server.  Only the scheme/host/port/path is taken from the portal; the query
-# string of the local ticket URL is preserved because it carries the values that
-# are known to work for this router (clientmac, iarmdst) plus the WAN address
-# that refresh_wan_ip keeps current.
+# Endpoint updates are candidates too: trusted host + path, then actual auth
+# and independent connectivity verification before local state is replaced.
 refresh_portal_endpoints() {
     now=$(date +%s)
     if [ -n "${last_portal_refresh:-}" ] &&
@@ -220,119 +177,46 @@ refresh_portal_endpoints() {
     fi
     last_portal_refresh=$now
     fetch_portal_page || return 1
-    page_ticket=$(extract_cdata_tag ticket-url "$portal_page_file")
-    page_auth=$(extract_cdata_tag auth-url "$portal_page_file")
-    case "$page_ticket" in http://*|https://*) ;; *) return 1 ;; esac
-    case "$page_auth" in http://*|https://*) ;; *) return 1 ;; esac
-    current_ticket=$(config_value TICKET_URL)
-    current_auth=$(config_value AUTH_URL)
-    new_ticket=$page_ticket
-    if [ -n "$current_ticket" ]; then
-        new_ticket="$(url_without_query "$page_ticket")$(url_query "$current_ticket")"
-    fi
-    new_auth=$page_auth
-    [ "$new_ticket" != "$current_ticket" ] || [ "$new_auth" != "$current_auth" ] || return 1
-    cp -p "$config" "$config.bak-portal-$(date +%Y%m%d-%H%M%S)" || return 1
-    tmp_config="$config.tmp.$$"
-    if sed -e "s#^TICKET_URL=.*#TICKET_URL='$(sed_replacement_escape "$new_ticket")'#" \
-           -e "s#^AUTH_URL=.*#AUTH_URL='$(sed_replacement_escape "$new_auth")'#" \
-           "$config" > "$tmp_config" &&
-        chmod 600 "$tmp_config" && mv "$tmp_config" "$config"; then
-        log_message "Portal endpoints changed: TICKET_URL $(url_without_query "$current_ticket") -> $(url_without_query "$new_ticket"), AUTH_URL $current_auth -> $new_auth."
+    endpoint_candidate="$runtime_dir/endpoints.conf"
+    "$helper_bin" endpoint-prepare "$config" "$portal_page_file" "$endpoint_candidate" || return 1
+    if activate_candidate "$endpoint_candidate"; then
+        log_message 'Trusted portal endpoints activated after authentication and strict connectivity verification.'
         return 0
     fi
-    rm -f "$tmp_config"
-    log_message 'Portal endpoint refresh could not rewrite the configuration file.'
+    log_message 'Endpoint candidate not activated; previous parameters and local session retained.'
     return 1
 }
 
-# A zero-UUID Algo-ID request makes the portal hand back the DaMod module it
-# currently wants; the module carries exactly one algorithm UUID.  This detects
-# an algorithm migration and says so in the log instead of retrying silently.
+# Never trust a non-empty old cache. Download into a private random directory,
+# fully decode and check the exact container UUID before publishing a new cache.
+# helper and damod run sequentially (no simultaneous resident Go processes).
 detect_portal_algorithm() {
-    ticket_url=$(config_value TICKET_URL)
-    configured_algo=$(config_value ALGO_ID)
-    case "$ticket_url" in http://*|https://*) ;; *) return 1 ;; esac
-    client_id=$(config_value CLIENT_ID)
-    user_agent=$(config_value USER_AGENT)
-    zero_algo='00000000-0000-0000-0000-000000000000'
-    printf '%s' "$zero_algo" > "$algo_probe_request_file" || return 1
-    algo_checksum=$(md5sum "$algo_probe_request_file" | awk '{ print toupper($1) }')
-    rm -f "$algo_probe_file"
-    if command -v curl >/dev/null 2>&1; then
-        curl -sS --connect-timeout "$probe_timeout" --max-time "$probe_timeout" \
-            -o "$algo_probe_file" -X POST --data-binary "@$algo_probe_request_file" \
-            -H 'Accept: text/html,text/xml,application/xhtml+xml,application/x-javascript,*/*' \
-            -H 'Connection: close' -H 'Content-Type: text/plain; charset=utf-8' \
-            -H "Client-ID: $client_id" -H "User-Agent: $user_agent" \
-            -H "Algo-ID: $zero_algo" -H "CDC-Checksum: $algo_checksum" \
-            "$ticket_url" >/dev/null 2>&1 || :
-    elif command -v wget >/dev/null 2>&1; then
-        wget -q -T "$probe_timeout" -O "$algo_probe_file" \
-            --header='Accept: text/html,text/xml,application/xhtml+xml,application/x-javascript,*/*' \
-            --header='Connection: close' \
-            --header='Content-Type: text/plain; charset=utf-8' \
-            --header="Client-ID: $client_id" \
-            --header="User-Agent: $user_agent" \
-            --header="Algo-ID: $zero_algo" \
-            --header="CDC-Checksum: $algo_checksum" \
-            --post-file="$algo_probe_request_file" "$ticket_url" >/dev/null 2>&1 || :
-    else
+    [ -x "$base_dir/damod" ] || { log_message 'DaMod decoder unavailable.'; return 1; }
+    "$helper_bin" module-fetch "$config" "$algo_probe_file" || return 1
+    algo_meta="$runtime_dir/module.json"
+    algo_candidate="$runtime_dir/algorithm.conf"
+    if ! "$base_dir/damod" -json "$algo_probe_file" > "$algo_meta"; then
+        rm -f "$algo_probe_file" "$algo_meta"
+        log_message 'Invalid module discarded; the next probe will download afresh.'
         return 1
     fi
-    detected_algo=$(grep -ao -E '[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}' "$algo_probe_file" 2>/dev/null | sort -u | sed -n '1p')
-    case "$detected_algo" in
-        '')
-            log_message 'Portal algorithm probe returned no algorithm ID; the portal may be unreachable.'
-            return 1
-            ;;
-        "$configured_algo") return 1 ;;
-        *)
-            log_message "Portal algorithm mismatch: the portal now serves $detected_algo but ALGO_ID is $configured_algo. Update ALGO_ID, CIPHER_SCHEME and the matching keys before retrying."
-            module_copy="$base_dir/damod-update.bin.$detected_algo"
-            if [ -s "$algo_probe_file" ] && [ ! -s "$module_copy" ]; then
-                if cp "$algo_probe_file" "$module_copy" && chmod 600 "$module_copy"; then
-                    log_message "Saved the portal algorithm module as $module_copy for analysis."
-                fi
-            fi
-            # Unpack the module the portal just rotated to and record the
-            # template plus its embedded key material.  The portal serves the
-            # current module on demand, so this is what lets a migration be
-            # followed without hand-analysing the download.
-            if [ -x "$base_dir/damod" ] && [ -s "$module_copy" ]; then
-                algo_env="$base_dir/algo-$detected_algo.env"
-                if "$base_dir/damod" -env "$module_copy" > "$algo_env.tmp" 2>/dev/null; then
-                    chmod 600 "$algo_env.tmp" && mv "$algo_env.tmp" "$algo_env"
-                    algo_template=$(sed -n "s/^DAMOD_TEMPLATE='\(.*\)'$/\1/p" "$algo_env")
-                    algo_keylen=$(sed -n "s/^DAMOD_KEYLEN=\(.*\)$/\1/p" "$algo_env")
-                    log_message "Portal module $detected_algo uses $algo_template (key length $algo_keylen); parameters written to $algo_env."
-                    if [ -x "$base_dir/cipher-helper" ]; then
-                        algo_key=$(sed -n "s/^DAMOD_KEY='\(.*\)'$/\1/p" "$algo_env")
-                        algo_iv=$(sed -n "s/^DAMOD_IV='\(.*\)'$/\1/p" "$algo_env")
-                        if printf 'x' | "$base_dir/cipher-helper" encrypt-raw "$algo_template" "$algo_key" "$algo_iv" > /dev/null 2>&1; then
-                            log_message "cipher-helper already drives $algo_template, so this migration only needs the new key material."
-                        else
-                            log_message "cipher-helper cannot drive $algo_template yet; that primitive has to be implemented before switching."
-                        fi
-                    fi
-                else
-                    rm -f "$algo_env.tmp"
-                    log_message "Could not unpack portal module $module_copy."
-                fi
-            fi
-            return 0
-            ;;
-    esac
+    "$helper_bin" candidate-prepare "$config" "$algo_meta" "$algo_probe_file" "$algo_candidate" || return 1
+    detected_algo=$("$helper_bin" config-get "$algo_candidate" ALGO_ID) || return 1
+    # candidate-prepare guarantees UUID shape; cache-publish uses random atomic
+    # staging and rejects symlinks. Failed downloads/unpacks never poison cache.
+    "$helper_bin" cache-publish "$algo_probe_file" "$base_dir/damod-update.bin.$detected_algo" "$detected_algo" || return 1
+    if activate_candidate "$algo_candidate"; then
+        log_message "Portal algorithm $detected_algo activated; raw parameters now drive auth and keep."
+        return 0
+    fi
+    log_message 'Algorithm candidate not activated; previous parameters and local session retained.'
+    return 1
 }
 
 check_portal_configuration() {
-    changed=0
-    if refresh_portal_endpoints; then
-        changed=1
-        log_message 'Portal endpoint configuration was updated; re-authenticating against the new endpoints.'
-    fi
-    detect_portal_algorithm || :
-    return "$changed"
+    if refresh_portal_endpoints; then return 0; fi
+    if detect_portal_algorithm; then return 0; fi
+    return 1
 }
 
 current_retry_delay() {
@@ -359,16 +243,7 @@ keep_alive() {
 }
 
 probe_online() {
-    : > "$probe_file" || return 1
-    if command -v curl >/dev/null 2>&1; then
-        curl -fLsS --connect-timeout "$probe_timeout" --max-time "$probe_timeout" -o "$probe_file" "$probe_url" >/dev/null 2>&1 || return 1
-    elif command -v wget >/dev/null 2>&1; then
-        wget -q -T "$probe_timeout" -O "$probe_file" "$probe_url" >/dev/null 2>&1 || return 1
-    else
-        log_message 'No curl or wget is available for connectivity checks.'
-        return 2
-    fi
-    [ ! -s "$probe_file" ]
+    "$helper_bin" probe "$probe_url" "$probe_timeout" >/dev/null 2>&1
 }
 
 verify_online_with_retries() {
@@ -384,19 +259,14 @@ verify_online_with_retries() {
 }
 
 authenticate() {
-    PORTAL_USER=$(sed -n '1p' "$user_file")
-    PORTAL_PASSWORD=$(sed -n '1p' "$password_file")
-    [ -n "$PORTAL_USER" ] && [ -n "$PORTAL_PASSWORD" ] || {
-        log_message 'The portal account or password is empty.'
-        return 1
-    }
-    export PORTAL_USER PORTAL_PASSWORD
+    load_credentials || { log_message 'Portal credentials are empty.'; return 1; }
     cd "$base_dir" || return 1
     sh "$client" "$config" auth
 }
 
 setup_credentials() {
     umask 077
+export PORTAL_TIME_OFFSET="$(date +%z)"
     printf 'Portal account: ' >&2
     IFS= read -r setup_user
     printf 'Portal password: ' >&2
@@ -421,6 +291,13 @@ setup_credentials() {
     fi
 }
 
+accept_online_session() {
+    consecutive_failures=0
+    keep_seconds=$(read_keep_interval)
+    next_keep=$(( $(date +%s) + keep_seconds ))
+    need_auth=0
+}
+
 run_loop() {
     check_files || return 1
     validate_delays
@@ -443,22 +320,25 @@ run_loop() {
         if [ "$need_auth" -eq 1 ]; then
             if authenticate; then
                 if verify_online_with_retries; then
-                    consecutive_failures=0
-                    keep_seconds=$(read_keep_interval)
-                    next_keep=$(( $(date +%s) + keep_seconds ))
-                    need_auth=0
+                    accept_online_session
                     log_message "Authentication accepted and connectivity verified; next keep-alive at $(format_time "$next_keep")."
                     sleep_for "$probe_interval"
                 else
                     if check_portal_configuration; then
-                        consecutive_failures=0
+                        accept_online_session
+                        log_message 'Verified migration activated; entering online keep-alive state without another authentication.'
+                        sleep_for "$probe_interval"
+                        continue
                     fi
                     backoff_retry 'Authentication response was accepted, but connectivity verification failed;'
                 fi
             else
                 if check_portal_configuration; then
-                    consecutive_failures=0
-                fi
+                        accept_online_session
+                        log_message 'Verified migration activated; entering online keep-alive state without another authentication.'
+                        sleep_for "$probe_interval"
+                        continue
+                    fi
                 backoff_retry 'Authentication failed;'
             fi
             continue
@@ -493,13 +373,15 @@ run_loop() {
     done
 }
 
+trap 'rm -rf "$runtime_dir"' EXIT
+trap 'exit 1' HUP INT TERM
 case "${1:-run}" in
     run) run_loop ;;
-    once) check_files && { refresh_wan_ip || :; authenticate; } ;;
-    keep) check_files && { refresh_wan_ip || :; keep_alive; } ;;
+    once) check_files && validate_delays && check_probe_tool && acquire_lock || exit 1; trap 'release_lock' EXIT; refresh_wan_ip || :; authenticate && verify_online_with_retries ;;
+    keep) check_files && validate_delays && check_probe_tool && acquire_lock || exit 1; trap 'release_lock' EXIT; refresh_wan_ip || :; keep_alive ;;
     check) validate_delays; probe_online; check_result=$?; rm -f "$probe_file"; exit "$check_result" ;;
-    refresh) check_files || exit 1; trap 'rm -f "$portal_page_file" "$algo_probe_file" "$algo_probe_request_file"' EXIT; if refresh_portal_endpoints; then echo 'Portal endpoints updated.'; else echo 'No portal endpoint change detected (or the portal page was unavailable).'; fi ;;
-    algo) check_files || exit 1; trap 'rm -f "$portal_page_file" "$algo_probe_file" "$algo_probe_request_file"' EXIT; if detect_portal_algorithm; then echo 'Portal algorithm differs from the configured ALGO_ID.'; else echo 'Portal algorithm matches the configured ALGO_ID, or could not be determined.'; fi ;;
+    refresh) check_files && validate_delays && check_probe_tool && acquire_lock || exit 1; trap 'release_lock' EXIT; if refresh_portal_endpoints; then echo 'Portal endpoints activated.'; else echo 'No verified endpoint update activated.'; exit 1; fi ;;
+    algo) check_files && validate_delays && check_probe_tool && acquire_lock || exit 1; trap 'release_lock' EXIT; if detect_portal_algorithm; then echo 'Portal algorithm activated.'; else echo 'No verified algorithm update activated.'; exit 1; fi ;;
     setup) setup_credentials ;;
     *) echo "Usage: sh $0 [run|once|keep|check|refresh|algo|setup]" >&2; exit 2 ;;
 esac
